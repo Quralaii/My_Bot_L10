@@ -64,6 +64,44 @@ it("asks for a city when the weather is requested without one", async () => {
 	expect(sent).toEqual(["Напиши /city и свой город"]);
 });
 
+it.each([
+	["no city field", '{"town":"Астана"}'],
+	["plain text", "Астана"],
+	["broken JSON", '{"city":'],
+	["empty value", ""],
+	["JSON null", "null"],
+	["a number", "42"],
+	["a string", '"Астана"'],
+	["a list", '["Астана"]'],
+	["city is a number", '{"city":123}'],
+	["city is null", '{"city":null}'],
+	["city is empty", '{"city":""}'],
+	["city is blank", '{"city":"   "}'],
+])("asks for a city when KV holds %s", async (_name, stored) => {
+	await env.CITY_KV.put("7", stored);
+	await say(7, "/weather");
+	expect(sent).toEqual(["Напиши /city и свой город"]);
+	expect(await env.CITY_KV.get("7")).toBe(stored); // чтение запись не трогает
+});
+
+it("repairs a bad value with /city", async () => {
+	await env.CITY_KV.put("8", '{"town":"Астана"}');
+	await say(8, "/city Астана");
+	await say(8, "/weather");
+	expect(sent).toEqual(["Запомнил город: Астана", "🌤 Астана: сейчас -7 °C, ветер 4 м/с"]);
+});
+
+it("reports a KV failure instead of asking for a city", async () => {
+	const brokenKv = {
+		get: () => Promise.reject(new Error("KV недоступен")),
+	} as unknown as KVNamespace;
+	await handleUpdate("test-token", brokenKv, {
+		update_id: 3,
+		message: { chat: { id: 9 }, text: "/weather" },
+	});
+	expect(sent).toEqual(["Не получилось: KV недоступен"]);
+});
+
 it("shows the weather for the saved city by command and by button", async () => {
 	await say(6, "/city Астана");
 	await say(6, "/weather");

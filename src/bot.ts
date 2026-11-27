@@ -148,9 +148,29 @@ async function saveSettings(
 	await kv.put(String(chatId), JSON.stringify(settings));
 }
 
-// null — этот чат ещё не выбирал город
+// null — города нет: чат его ещё не выбирал или в KV лежит не ChatSettings
 async function loadSettings(kv: KVNamespace, chatId: number): Promise<ChatSettings | null> {
-	return await kv.get<ChatSettings>(String(chatId), "json");
+	// читаем как текст: ошибка самого KV уйдёт дальше, а не превратится в «города нет»
+	const raw = await kv.get(String(chatId));
+	return raw === null ? null : parseSettings(raw);
+}
+
+// interface проверяется только до запуска, поэтому данные из KV проверяем сами
+function parseSettings(raw: string): ChatSettings | null {
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch {
+		return null; // не JSON
+	}
+	if (typeof value !== "object" || value === null || !("city" in value)) {
+		return null; // не объект или нет поля city
+	}
+	const { city } = value;
+	if (typeof city !== "string" || city.trim() === "") {
+		return null; // в city не текст или пусто
+	}
+	return { city };
 }
 
 // ---------- Данные из API ----------
