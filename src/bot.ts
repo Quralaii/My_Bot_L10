@@ -1,6 +1,6 @@
 // Promise Bot — Telegram-бот с кнопками: валюты, погода, Promise.race, информация о странах.
 // Работает как Cloudflare Worker: Telegram сам присылает обновления на адрес /telegram (webhook).
-// Worker не помнит ничего между запросами, поэтому режим «жду название страны»
+// Worker не помнит ничего между запросами, поэтому режим «жду ответ» (страна, имя, возраст)
 // держится на ответе (reply) на сообщение бота, а не на переменной в памяти.
 // Настройки пользователя (город, имя и другие) хранятся в Workers KV (привязка CITY_KV).
 
@@ -110,6 +110,21 @@ async function send(
 	});
 }
 
+// Задаёт вопрос: force_reply открывает у пользователя ответ на это сообщение,
+// а по тексту вопроса бот потом понимает, что именно ему прислали
+async function ask(
+	token: string,
+	chatId: number,
+	question: string,
+	placeholder: string,
+): Promise<void> {
+	await telegram(token, "sendMessage", {
+		chat_id: chatId,
+		text: question,
+		reply_markup: { force_reply: true, input_field_placeholder: placeholder },
+	});
+}
+
 // В режиме HTML символы < > & нужно экранировать
 function escapeHtml(text: string): string {
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -117,9 +132,17 @@ function escapeHtml(text: string): string {
 
 // ---------- Кнопки ----------
 
-// Главное меню: 2 ряда по 2 кнопки; callback_data приходит боту при нажатии
+// Главное меню; callback_data приходит боту при нажатии
 function menuKeyboard(t: Texts): Keyboard {
 	return [
+		[
+			{ text: t.nameButton, callback_data: "name" },
+			{ text: t.languageButton, callback_data: "language" },
+		],
+		[
+			{ text: t.ageButton, callback_data: "age" },
+			{ text: t.myCountryButton, callback_data: "mycountry" },
+		],
 		[
 			{ text: t.ratesButton, callback_data: "rates" },
 			{ text: t.weatherButton, callback_data: "weather" },
@@ -128,11 +151,34 @@ function menuKeyboard(t: Texts): Keyboard {
 			{ text: "⚡ Promise Race", callback_data: "race" },
 			{ text: t.countryButton, callback_data: "country" },
 		],
+		[{ text: t.profileButton, callback_data: "profile" }],
 	];
 }
 
 function backKeyboard(t: Texts): Keyboard {
 	return [[{ text: t.menuButton, callback_data: "menu" }]];
+}
+
+// Выбор языка; названия не переводятся, чтобы свой язык было легко найти
+function languageKeyboard(t: Texts): Keyboard {
+	return [
+		[
+			{ text: "Русский", callback_data: "lang:ru" },
+			{ text: "Қазақша", callback_data: "lang:kk" },
+			{ text: "English", callback_data: "lang:en" },
+		],
+		...backKeyboard(t),
+	];
+}
+
+// Под справкой о своей стране
+function myCountryKeyboard(t: Texts): Keyboard {
+	return [
+		[
+			{ text: t.changeCountryButton, callback_data: "changecountry" },
+			{ text: t.menuButton, callback_data: "menu" },
+		],
+	];
 }
 
 function countryKeyboard(t: Texts): Keyboard {
@@ -505,7 +551,7 @@ async function sendMyCountry(
 	}
 	const summary = await findCountry(country, language);
 	const answer = summary === undefined ? t.countryNotFound : countryText(t, summary);
-	await send(token, chatId, answer, backKeyboard(t));
+	await send(token, chatId, answer, myCountryKeyboard(t));
 }
 
 // /profile — всё, что бот запомнил об этом чате
@@ -573,16 +619,48 @@ async function handleButton(
 			await send(token, chatId, await raceText(t), backKeyboard(t));
 			break;
 		case "country":
-			// force_reply открывает у пользователя ответ на это сообщение; ответ узнаём по тексту
-			await telegram(token, "sendMessage", {
-				chat_id: chatId,
-				text: t.countryQuestion,
-				reply_markup: { force_reply: true, input_field_placeholder: t.countryPlaceholder },
-			});
+			await ask(token, chatId, t.countryQuestion, t.countryPlaceholder);
+			break;
+		case "name":
+			await ask(token, chatId, t.nameQuestion, t.namePlaceholder);
+			break;
+		case "age":
+			await ask(token, chatId, t.ageQuestion, t.agePlaceholder);
+			break;
+		case "language":
+			await send(token, chatId, t.chooseLanguage, languageKeyboard(t));
+			break;
+		case "lang:ru":
+		case "lang:kk":
+		case "lang:en":
+			await setLanguage(token, kv, chatId, language, data.slice("lang:".length));
+			break;
+		case "mycountry": {
+			// страна уже есть — показываем справку, нет — спрашиваем
+			const { country } = await loadSettings(kv, chatId);
+			if (country === undefined) {
+				await ask(token, chatId, t.myCountryQuestion, t.countryPlaceholder);
+			} else {
+				await sendMyCountry(token, kv, chatId, language);
+			}
+			break;
+		}
+		case "changecountry":
+			await ask(token, chatId, t.myCountryQuestion, t.countryPlaceholder);
+			break;
+		case "profile":
+			await sendProfile(token, kv, chatId, language);
 			break;
 		default:
 			await send(token, chatId, t.unknownButton, backKeyboard(t));
 	}
+}
+
+type Question = "countryQuestion" | "nameQuestion" | "ageQuestion" | "myCountryQuestion";
+
+// Это ответ на такой вопрос? Вопрос мог быть задан до смены языка, поэтому сверяем со всеми
+function isReplyTo(question: Question, repliedTo: string | undefined): boolean {
+	return Object.values(texts).some((t) => t[question] === repliedTo);
 }
 
 // Реакция на обычное текстовое сообщение
@@ -630,8 +708,20 @@ async function handleText(
 		}
 		return;
 	}
-	// вопрос о стране мог быть задан до смены языка, поэтому сверяем со всеми
-	if (Object.values(texts).some((other) => other.countryQuestion === repliedTo)) {
+	const reply = text.trim().replace(/\s+/g, " ");
+	if (isReplyTo("nameQuestion", repliedTo)) {
+		await setName(token, kv, chatId, language, reply);
+		return;
+	}
+	if (isReplyTo("ageQuestion", repliedTo)) {
+		await setAge(token, kv, chatId, language, reply);
+		return;
+	}
+	if (isReplyTo("myCountryQuestion", repliedTo)) {
+		await setCountry(token, kv, chatId, language, reply);
+		return;
+	}
+	if (isReplyTo("countryQuestion", repliedTo)) {
 		const country = await findCountry(text, language);
 		const answer = country === undefined ? t.countryNotFound : countryText(t, country);
 		await send(token, chatId, answer, countryKeyboard(t));
