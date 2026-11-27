@@ -2,8 +2,24 @@
 // Работает как Cloudflare Worker: Telegram сам присылает обновления на адрес /telegram (webhook).
 // Worker не помнит ничего между запросами, поэтому режим «жду название страны»
 // держится на ответе (reply) на сообщение бота, а не на переменной в памяти.
+// Город пользователя хранится в Workers KV (привязка CITY_KV).
 
 // ---------- Типы ----------
+
+// Настройки чата; в KV лежат как JSON, ключ — id чата
+export interface ChatSettings {
+	city: string;
+}
+
+// Ответ поиска городов Open-Meteo; если ничего не найдено, поля results нет
+interface Place {
+	name: string;
+	latitude: number;
+	longitude: number;
+}
+interface GeocodingResponse {
+	results?: Place[];
+}
 
 interface Weather {
 	current: {
@@ -120,12 +136,39 @@ const greeting = "Привет! 👋\n\nЯ - Promise Bot!\n\nУ меня ест�
 // Этот текст бот просит ответить на него; по нему же узнаём, что пользователь прислал страну
 const countryPrompt = "🌍 Напишите название страны, например: Казахстан";
 
+const cityPrompt = "Напиши /city и свой город";
+
+// ---------- Память (KV) ----------
+
+async function saveSettings(
+	kv: KVNamespace,
+	chatId: number,
+	settings: ChatSettings,
+): Promise<void> {
+	await kv.put(String(chatId), JSON.stringify(settings));
+}
+
+// null — этот чат ещё не выбирал город
+async function loadSettings(kv: KVNamespace, chatId: number): Promise<ChatSettings | null> {
+	return await kv.get<ChatSettings>(String(chatId), "json");
+}
+
 // ---------- Данные из API ----------
 
-// Погода в Алматы (ветер сразу в м/с)
-async function getWeather(): Promise<Weather> {
-	const url =
-		"https://api.open-meteo.com/v1/forecast?latitude=43.24&longitude=76.89&current=temperature_2m,wind_speed_10m&wind_speed_unit=ms";
+// Ищет город по названию и возвращает его координаты
+async function findCity(name: string): Promise<Place | undefined> {
+	const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=ru`;
+	const response = await fetch(url);
+	if (!response.ok) {
+		throw new Error(`Поиск города: сервер ответил ${response.status}`);
+	}
+	const data = (await response.json()) as GeocodingResponse;
+	return data.results?.[0];
+}
+
+// Погода по координатам (ветер сразу в м/с)
+async function getWeather(latitude: number, longitude: number): Promise<Weather> {
+	const url = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,wind_speed_10m&wind_speed_unit=ms`;
 	const response = await fetch(url);
 	if (!response.ok) {
 		throw new Error(`Погода: сервер ответил ${response.status}`);
@@ -164,8 +207,8 @@ async function getCountry(name: string): Promise<WikiSummary | undefined> {
 
 // ---------- Тексты ответов ----------
 
-function weatherText(weather: Weather): string {
-	return `🌤 В Алматы сейчас ${weather.current.temperature_2m} °C, ветер ${weather.current.wind_speed_10m} м/с`;
+function weatherText(city: string, weather: Weather): string {
+	return `🌤 ${escapeHtml(city)}: сейчас ${weather.current.temperature_2m} °C, ветер ${weather.current.wind_speed_10m} м/с`;
 }
 
 const currencies: Record<string, string> = {
@@ -226,7 +269,7 @@ async function timed(name: string, request: () => Promise<unknown>): Promise<Tim
 // Promise.race: запускаем три запроса одновременно, смотрим, кто финиширует первым
 async function raceText(): Promise<string> {
 	const runners = [
-		timed("open-meteo.com (погода)", getWeather),
+		timed("open-meteo.com (погода)", () => getWeather(43.24, 76.89)), // для замера — Алматы
 		timed("open.er-api.com (курсы)", getRates),
 		timed("ru.wikipedia.org (страны)", () => getCountry("Казахстан")),
 	];
@@ -244,16 +287,58 @@ async function raceText(): Promise<string> {
 	return `⚡ <b>Promise.race</b> — кто ответит быстрее?\n\n${escapeHtml(lines.join("\n"))}`;
 }
 
+// ---------- Команды города и погоды ----------
+
+// /city Астана — проверяет, что такой город есть, и запоминает его
+async function setCity(
+	token: string,
+	kv: KVNamespace,
+	chatId: number,
+	city: string,
+): Promise<void> {
+	if (city === "") {
+		await send(token, chatId, cityPrompt, backKeyboard);
+		return;
+	}
+	if ((await findCity(city)) === undefined) {
+		const answer = "Такой город не нашёл. Проверьте название и попробуйте ещё раз.";
+		await send(token, chatId, answer, backKeyboard);
+		return;
+	}
+	await saveSettings(kv, chatId, { city });
+	await send(token, chatId, `Запомнил город: ${escapeHtml(city)}`, backKeyboard);
+}
+
+// Погода в городе, который этот чат сохранил через /city
+async function sendWeather(token: string, kv: KVNamespace, chatId: number): Promise<void> {
+	const settings = await loadSettings(kv, chatId);
+	if (settings === null) {
+		await send(token, chatId, cityPrompt, backKeyboard);
+		return;
+	}
+	const place = await findCity(settings.city);
+	if (place === undefined) {
+		throw new Error(`Поиск города: «${settings.city}» не найден`);
+	}
+	const weather = await getWeather(place.latitude, place.longitude);
+	await send(token, chatId, weatherText(place.name, weather), backKeyboard);
+}
+
 // ---------- Обработка нажатий и сообщений ----------
 
 // Реакция на нажатие кнопки: data — это callback_data нажатой кнопки
-async function handleButton(token: string, chatId: number, data: string): Promise<void> {
+async function handleButton(
+	token: string,
+	kv: KVNamespace,
+	chatId: number,
+	data: string,
+): Promise<void> {
 	switch (data) {
 		case "menu":
 			await send(token, chatId, greeting, menuKeyboard);
 			break;
 		case "weather":
-			await send(token, chatId, weatherText(await getWeather()), backKeyboard);
+			await sendWeather(token, kv, chatId);
 			break;
 		case "rates":
 			await send(token, chatId, ratesText(await getRates()), backKeyboard);
@@ -277,12 +362,22 @@ async function handleButton(token: string, chatId: number, data: string): Promis
 // Реакция на обычное текстовое сообщение
 async function handleText(
 	token: string,
+	kv: KVNamespace,
 	chatId: number,
 	text: string,
 	repliedTo: string | undefined,
 ): Promise<void> {
 	if (text.startsWith("/")) {
-		await send(token, chatId, greeting, menuKeyboard); // /start, /menu и любая другая команда
+		// "/city@имя_бота Нью Йорк" -> команда "/city", остальное "Нью Йорк"
+		const [first = "", ...rest] = text.trim().split(/\s+/);
+		const command = first.split("@")[0];
+		if (command === "/city") {
+			await setCity(token, kv, chatId, rest.join(" "));
+		} else if (command === "/weather") {
+			await sendWeather(token, kv, chatId);
+		} else {
+			await send(token, chatId, greeting, menuKeyboard); // /start, /menu и любая другая команда
+		}
 		return;
 	}
 	if (repliedTo === countryPrompt) {
@@ -309,7 +404,7 @@ async function run(token: string, chatId: number, action: () => Promise<void>): 
 }
 
 // Разбирает одно обновление от Telegram: нажатие кнопки или текст
-export async function handleUpdate(token: string, update: Update): Promise<void> {
+export async function handleUpdate(token: string, kv: KVNamespace, update: Update): Promise<void> {
 	const query = update.callback_query;
 	if (query !== undefined) {
 		const chatId = query.message?.chat.id;
@@ -317,7 +412,7 @@ export async function handleUpdate(token: string, update: Update): Promise<void>
 		await telegram(token, "answerCallbackQuery", { callback_query_id: query.id });
 		if (chatId !== undefined && query.data !== undefined) {
 			const data = query.data;
-			await run(token, chatId, () => handleButton(token, chatId, data));
+			await run(token, chatId, () => handleButton(token, kv, chatId, data));
 		}
 		return;
 	}
@@ -326,6 +421,7 @@ export async function handleUpdate(token: string, update: Update): Promise<void>
 	if (message?.text !== undefined) {
 		const text = message.text;
 		const repliedTo = message.reply_to_message?.text;
-		await run(token, message.chat.id, () => handleText(token, message.chat.id, text, repliedTo));
+		const chatId = message.chat.id;
+		await run(token, chatId, () => handleText(token, kv, chatId, text, repliedTo));
 	}
 }

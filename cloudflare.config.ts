@@ -18,6 +18,8 @@ export default defineConfig({
 			// Секреты задаются в dash.cloudflare.com (или `npx cf workers secrets`), в репозиторий не попадают
 			BOT_TOKEN: bindings.secret(),
 			WEBHOOK_SECRET: bindings.secret(),
+			// KV namespace my-bot-memory: здесь бот помнит город каждого чата
+			CITY_KV: bindings.kv({ id: "61b00fcc97ee46018b069448eeb5c5e7" }),
 		},
 	},
 });

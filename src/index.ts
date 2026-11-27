@@ -16,7 +16,7 @@ export default {
 			}
 			const update = (await request.json()) as Update; //ожидаем пока получаем обновление 
 	
-			ctx.waitUntil(handleUpdate(env.BOT_TOKEN, update)); //вызываем функцию handleUpdate с токеном бота и обновлением
+			ctx.waitUntil(handleUpdate(env.BOT_TOKEN, env.CITY_KV, update)); //вызываем функцию handleUpdate с токеном бота, KV и обновлением
 			return new Response("ok");    //возвращаем ответ "ok"
 		}
 
